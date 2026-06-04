@@ -1,0 +1,229 @@
+{
+  "enabled": {
+    "description": "启用插件",
+    "type": "bool",
+    "hint": "插件总开关，关闭后所有功能停止",
+    "default": true
+  },
+  "auto_detect_enabled": {
+    "description": "启用自动检测",
+    "type": "bool",
+    "hint": "开启后，接收到任何图片都会自动分析EXIF并回传结果。关闭后仅响应指令查询。",
+    "default": true
+  },
+  "admin_users": {
+    "description": "插件管理员列表",
+    "type": "list",
+    "hint": "输入用户ID（QQ号等），这些用户拥有管理权限。AstrBot全站管理员默认拥有权限",
+    "default": []
+  },
+  "max_image_size_mb": {
+    "description": "最大处理图片大小(MB)",
+    "type": "int",
+    "hint": "超过此大小的图片将跳过EXIF分析，RAW文件建议设置较大值(如50)",
+    "default": 50
+  },
+  "display_fields": {
+    "description": "📋 自定义显示字段",
+    "type": "object",
+    "hint": "控制哪些EXIF字段在自动检测回复中显示",
+    "items": {
+      "camera_make": {
+        "description": "相机品牌/制造商",
+        "type": "bool",
+        "default": true
+      },
+      "camera_model": {
+        "description": "相机型号",
+        "type": "bool",
+        "default": true
+      },
+      "lens_model": {
+        "description": "镜头型号",
+        "type": "bool",
+        "default": true
+      },
+      "focal_length": {
+        "description": "焦距",
+        "type": "bool",
+        "default": true
+      },
+      "aperture": {
+        "description": "光圈值",
+        "type": "bool",
+        "default": true
+      },
+      "shutter_speed": {
+        "description": "快门速度",
+        "type": "bool",
+        "default": true
+      },
+      "iso": {
+        "description": "ISO感光度",
+        "type": "bool",
+        "default": true
+      },
+      "exposure_mode": {
+        "description": "曝光模式",
+        "type": "bool",
+        "default": true
+      },
+      "white_balance": {
+        "description": "白平衡",
+        "type": "bool",
+        "default": false
+      },
+      "metering_mode": {
+        "description": "测光模式",
+        "type": "bool",
+        "default": false
+      },
+      "flash": {
+        "description": "闪光灯状态",
+        "type": "bool",
+        "default": false
+      },
+      "exposure_compensation": {
+        "description": "曝光补偿",
+        "type": "bool",
+        "default": true
+      },
+      "date_time": {
+        "description": "拍摄时间",
+        "type": "bool",
+        "default": true
+      },
+      "image_size": {
+        "description": "图片尺寸",
+        "type": "bool",
+        "default": true
+      },
+      "gps": {
+        "description": "GPS位置信息",
+        "type": "bool",
+        "default": false
+      },
+      "software": {
+        "description": "后期处理软件",
+        "type": "bool",
+        "default": false
+      },
+      "shutter_count": {
+        "description": "快门次数",
+        "type": "bool",
+        "default": true
+      },
+      "serial_number": {
+        "description": "机身序列号",
+        "type": "bool",
+        "default": false
+      }
+    }
+  },
+  "raw_format_config": {
+    "description": "📸 RAW格式解析配置",
+    "type": "object",
+    "hint": "RAW格式文件解析相关配置",
+    "items": {
+      "enable_raw_parsing": {
+        "description": "启用RAW格式解析",
+        "type": "bool",
+        "hint": "开启后将尝试解析RAW文件。需要安装rawpy库(libraw)支持",
+        "default": true
+      },
+      "raw_preview_only": {
+        "description": "RAW仅解析预览图",
+        "type": "bool",
+        "hint": "如果rawpy不可用或解析失败，尝试提取RAW文件内嵌的JPEG预览图来获取EXIF",
+        "default": true
+      },
+      "raw_timeout_seconds": {
+        "description": "RAW文件解析超时(秒)",
+        "type": "int",
+        "hint": "RAW文件解析耗时较长，设置超时防止阻塞",
+        "default": 30
+      }
+    }
+  },
+  "group_chat_filter": {
+    "description": "👥 群聊过滤设置",
+    "type": "object",
+    "hint": "群聊黑白名单配置（白名单优先级高于黑名单）",
+    "items": {
+      "mode": {
+        "description": "过滤模式",
+        "type": "string",
+        "hint": "blacklist=黑名单模式(默认所有群可用)，whitelist=白名单模式(仅列表内群可用)，all=所有群都可用",
+        "default": "all"
+      },
+      "whitelist": {
+        "description": "群聊白名单(群号)",
+        "type": "list",
+        "hint": "白名单模式时仅这些群可用",
+        "default": []
+      },
+      "blacklist": {
+        "description": "群聊黑名单(群号)",
+        "type": "list",
+        "hint": "黑名单模式时这些群不可用",
+        "default": []
+      }
+    }
+  },
+  "private_chat_filter": {
+    "description": "💬 私聊过滤设置",
+    "type": "object",
+    "hint": "私聊黑白名单配置（白名单优先级高于黑名单）",
+    "items": {
+      "mode": {
+        "description": "过滤模式",
+        "type": "string",
+        "hint": "blacklist=黑名单模式(默认所有私聊可用)，whitelist=白名单模式(仅列表内用户可用)，all=所有私聊都可用",
+        "default": "all"
+      },
+      "whitelist": {
+        "description": "私聊白名单(用户QQ号)",
+        "type": "list",
+        "hint": "白名单模式时仅这些用户可用",
+        "default": []
+      },
+      "blacklist": {
+        "description": "私聊黑名单(用户QQ号)",
+        "type": "list",
+        "hint": "黑名单模式时这些用户不可用",
+        "default": []
+      }
+    }
+  },
+  "reply_mode": {
+    "description": "💬 回复模式",
+    "type": "string",
+    "hint": "选择检测到相机图片后的回复方式",
+    "options": ["文本发送", "转发发送", "不发送"],
+    "default": "文本发送"
+  },
+  "forward_display_name": {
+    "description": "转发显示名称(仅转发发送模式)",
+    "type": "string",
+    "hint": "转发发送模式下在QQ显示的自定义名称",
+    "default": "相机EXIF分析"
+  },
+  "allow_reference_query": {
+    "description": "允许引用查询他人图片",
+    "type": "bool",
+    "hint": "开启后别人可@引用你的图+指令查EXIF；关闭后仅原发送者可引用自己的图，别人引用查不到",
+    "default": false
+  },
+  "show_analyzing_hint": {
+    "description": "显示分析中提示",
+    "type": "bool",
+    "hint": "分析完成后显示'正在分析...'提示",
+    "default": true
+  },
+  "show_detailed_exif_default": {
+    "description": "默认显示详细EXIF",
+    "type": "bool",
+    "hint": "开启后自动检测回复默认显示完整EXIF，关闭则显示摘要",
+    "default": false
+  }
+}
