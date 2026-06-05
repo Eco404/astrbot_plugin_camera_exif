@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import math
 import io
 import json
 import os
@@ -129,6 +130,21 @@ SHUTTER_COUNT_TAGS: dict[str, list[int | str]] = {
     "LEICA": [0x0010, "ShutterCount"],
     "Minolta": [0x0020, "ShutterCount"],
 }
+
+
+# ============================================================
+# rawpy 辅助（模块级函数，供 run_in_executor 调用）
+# ============================================================
+
+def _extract_raw_preview_rawpy(file_path: str):
+    """rawpy 提取 RAW 全尺寸图像为 numpy array (H, W, 3)"""
+    import rawpy  # type: ignore
+    with rawpy.imread(file_path) as raw:
+        rgb = raw.postprocess(
+            use_camera_wb=True, output_color=rawpy.ColorSpace.sRGB,
+            no_auto_bright=True, output_bps=8,
+        )
+        return rgb.copy()  # 返回副本，避免 raw 关闭后内存失效
 
 
 # ============================================================
@@ -320,6 +336,8 @@ class ExifAnalyzer:
             "exif_data": {},
             "shutter_count": None,
             "gps": {},
+            "maker_note": {},
+            "xmp": {},
             "errors": [],
         }
 
@@ -329,54 +347,59 @@ class ExifAnalyzer:
             f"RAW: {self.is_raw}, 格式: {self.file_ext})"
         )
 
-        # Step 1: 先用 PIL 提取基础 EXIF（含 img.info 原始字节解析）
+        # Step 1: PIL 提取（含 img.info 原始字节解析）
         pil_data = self._extract_pil_exif()
-        pil_keys = [k for k in pil_data if not k.startswith("_")]
-        logger.info(f"[相机EXIF] PIL步骤: {len(pil_keys)} 标签, 全部键: {sorted([k for k in pil_data if not k.startswith('_')])}")
+        logger.info(f"[相机EXIF] PIL步骤: {len(pil_data)} 标签")
         if pil_data:
             result["exif_data"].update(pil_data)
 
-        # Step 2: 用 exifread 直接解析文件补充
+        # Step 2: exifread 补充（始终合并，RAW 的 PIL 标签不完整）
         exifread_data = self._extract_exifread()
-        exifread_keys = [k for k in exifread_data if not k.startswith("_")]
-        logger.info(f"[相机EXIF] exifread步骤: {len(exifread_keys)} 标签: {exifread_keys[:10]}")
         if exifread_data:
+            logger.info(f"[相机EXIF] exifread步骤: {len(exifread_data)} 标签")
             for k, v in exifread_data.items():
                 if k not in result["exif_data"] or result["exif_data"].get(k, "") == "":
                     result["exif_data"][k] = v
 
-        # 判断是否为相机图片（多重指标，不只依赖 Make）
+        # 判断 + 回退品牌/型号
         result["is_camera_image"] = self._is_camera_image(result["exif_data"])
+        self._fill_missing_brand(result["exif_data"])
 
-        # Step 3: RAW 文件回退 — rawpy
+        # Step 3: RAW rawpy 回退
         if self.is_raw and not result["is_camera_image"] and HAS_RAWPY:
             raw_data = self._extract_rawpy()
             if raw_data:
                 result["exif_data"].update(raw_data)
                 result["is_camera_image"] = True
 
-        # Step 4: 提取快门次数
+        # Step 4: MakerNote 详细信息（优先用已提取的原始字节）
         if result["is_camera_image"]:
-            try:
-                makernote_raw = result.get("_raw_makernote", b"")
-                if not isinstance(makernote_raw, bytes):
-                    makernote_raw = str(makernote_raw).encode("utf-8", errors="replace")
-                result["shutter_count"] = self._extract_shutter_count(
-                    result["exif_data"].get("Make", ""),
-                    makernote_raw,
-                )
-                if result["shutter_count"]:
-                    logger.info(f"[相机EXIF] 快门次数: {result['shutter_count']}")
-            except Exception as e:
-                logger.warning(f"[相机EXIF] 快门提取整体失败: {e}")
+            mn_raw = result["exif_data"].get("_raw_makernote", b"")
+            if isinstance(mn_raw, str):
+                mn_raw = mn_raw.encode("utf-8", errors="replace")
+            if not isinstance(mn_raw, bytes):
+                mn_raw = b""
+            mn_data = self._extract_makernote_details(mn_raw)
+            if mn_data:
+                result["maker_note"] = mn_data
+                # 快门次数
+                sc = mn_data.get("shutter_count")
+                if sc:
+                    result["shutter_count"] = str(sc)
+                    logger.info(f"[相机EXIF] 快门次数: {sc}")
 
-        # Step 5: 格式化 GPS
+        # Step 5: XMP 基础信息
+        xmp = self._extract_xmp_basics(result["exif_data"])
+        if xmp:
+            result["xmp"] = xmp
+
+        # Step 6: GPS
         result["gps"] = self._extract_gps(result["exif_data"])
 
         total_keys = len([k for k in result["exif_data"] if not k.startswith("_")])
         logger.info(
             f"[相机EXIF] 分析完成: is_camera={result['is_camera_image']}, "
-            f"总标签数={total_keys}, 快门={result['shutter_count']}"
+            f"总标签={total_keys}, 快门={result['shutter_count']}"
         )
 
         return result
@@ -434,15 +457,13 @@ class ExifAnalyzer:
                             pass
                     data[tag_name] = _clean_tag_value(value)
 
-            # 方法2: 从 img.info 中解析原始 EXIF 字节 (核心修复)
-            if not data.get("Make") and hasattr(img, "info"):
+            # 方法2: 从 img.info 中解析原始 EXIF 字节
+            if hasattr(img, "info"):
                 raw_exif = img.info.get("exif") or img.info.get("Exif") or img.info.get("EXIF")
                 if raw_exif and isinstance(raw_exif, bytes) and len(raw_exif) > 20:
-                    logger.info(f"[相机EXIF] img.info有 {len(raw_exif)} 字节原始EXIF")
                     parsed = self._parse_raw_exif_bytes(raw_exif)
                     if parsed:
                         data.update(parsed)
-                        logger.info(f"[相机EXIF] 原始EXIF解析成功: {len(parsed)} 标签")
 
             img.close()
 
@@ -455,19 +476,15 @@ class ExifAnalyzer:
     def _parse_raw_exif_bytes(self, raw_exif: bytes) -> dict[str, Any]:
         """从原始 EXIF 字节数据中解析标签（处理 JPEG APP1 包装和 TIFF 格式）"""
         data: dict[str, Any] = {}
-        logger.info(f"[相机EXIF] 原始字节: {len(raw_exif)}B, 前8B hex: {raw_exif[:8].hex()}")
 
-        # 剥离 JPEG APP1 包装头 "Exif\x00\x00"（6字节）
+        # 剥离 "Exif\x00\x00" 前缀
         tiff_data = raw_exif
         if raw_exif[:6] == b"Exif\x00\x00":
             tiff_data = raw_exif[6:]
         elif raw_exif[:4] == b"Exif":
             tiff_data = raw_exif[4:]
 
-        logger.info(f"[相机EXIF] 剥离前缀后 {len(tiff_data)}B, 前4B hex: {tiff_data[:4].hex()}")
-
-        # 扫描 TIFF 头 (MM\x00\x2A for big-endian, II\x2A\x00 for little-endian)
-        # 多种可能的偏移位置
+        # 寻找 TIFF 头
         offsets_to_try: list[int] = [0]
         for scan_offset in range(len(tiff_data) - 4):
             chunk = tiff_data[scan_offset:scan_offset + 4]
@@ -475,28 +492,19 @@ class ExifAnalyzer:
                 if scan_offset > 0:
                     offsets_to_try.append(scan_offset)
                 break
-        # 去重并排序
-        offsets_to_try = sorted(set(offsets_to_try))
 
-        for offset in offsets_to_try:
+        for offset in sorted(set(offsets_to_try)):
             candidate = tiff_data[offset:]
-            if len(candidate) < 10:
+            if len(candidate) < 10 or candidate[:2] not in (b"MM", b"II"):
                 continue
-            hdr = candidate[:2]
-            if hdr not in (b"MM", b"II"):
-                continue
-
-            logger.info(f"[相机EXIF] 偏移{offset}: TIFF头={candidate[:4].hex()}, 剩余{len(candidate)}B")
             try:
                 import exifread
                 from io import BytesIO
                 stream = BytesIO(candidate)
                 tags = exifread.process_file(stream, details=True, debug=False)
-                tag_count = len(tags)
-                if tag_count >= 2:  # 至少要有有意义的标签
-                    for tag_name, tag_value in tags.items():
-                        if tag_name in ("JPEGThumbnail", "TIFFThumbnail"):
-                            continue
+                for tag_name, tag_value in tags.items():
+                    if tag_name in ("JPEGThumbnail", "TIFFThumbnail"):
+                        continue
                         short_name = tag_name.split()[-1] if " " in tag_name else tag_name
                         val = str(tag_value)
                         if short_name in ("FNumber", "FocalLength", "ExposureTime",
@@ -507,18 +515,13 @@ class ExifAnalyzer:
                             except Exception:
                                 pass
                         data[short_name] = val
-                    logger.info(f"[相机EXIF] 偏移{offset}成功解析 {tag_count} 标签: {list(data.keys())[:10]}")
-                    # 调试：打印所有键名，检查是否有 Make/Model 相关
-                    all_keys = sorted(data.keys())
-                    logger.info(f"[相机EXIF] 全部标签键({len(all_keys)}): {all_keys}")
-                    break
-                else:
-                    logger.info(f"[相机EXIF] 偏移{offset}仅解析到 {tag_count} 标签(太少,跳过)")
-            except Exception as e:
-                logger.warning(f"[相机EXIF] 偏移{offset}解析异常: {type(e).__name__}: {e}")
-
-        if not data:
-            logger.warning(f"[相机EXIF] 所有偏移都未能解析EXIF")
+                        if " " in tag_name and short_name != tag_name:
+                            data[tag_name] = val
+                    if len(tags) >= 2:
+                        logger.info(f"[相机EXIF] 原始字节EXIF解析(偏移{offset}): {len(tags)} 标签")
+                        break
+            except Exception:
+                pass
 
         return data
 
@@ -530,15 +533,37 @@ class ExifAnalyzer:
             with open(self.file_path, "rb") as f:
                 tags = exifread.process_file(f, details=True, debug=False)
 
-            logger.info(f"[相机EXIF] exifread直接解析: {len(tags)} 个标签, 原始键: {sorted(tags.keys())[:20]}")
-            logger.info(f"[相机EXIF] exifread处理后键: {sorted(data.keys())}")
-
             for tag_name, tag_value in tags.items():
                 if tag_name in ("JPEGThumbnail", "TIFFThumbnail"):
                     continue
                 if "MakerNote" in tag_name:
                     if hasattr(tag_value, "values"):
-                        data["_raw_makernote"] = str(tag_value.values).encode()
+                        vals = tag_value.values
+                        new_mn: bytes = b""
+                        if isinstance(vals, bytes):
+                            new_mn = vals
+                        elif isinstance(vals, (list, tuple)):
+                            raw_bytes = bytearray()
+                            for b in vals:
+                                try:
+                                    if isinstance(b, int):
+                                        raw_bytes.append(b & 0xFF)
+                                    elif isinstance(b, bytes):
+                                        raw_bytes.extend(b)
+                                    elif hasattr(b, "numerator") and hasattr(b, "denominator"):
+                                        raw_bytes.append(b.numerator & 0xFF)
+                                except Exception:
+                                    pass
+                            if raw_bytes:
+                                new_mn = bytes(raw_bytes)
+                            else:
+                                new_mn = str(vals).encode()
+                        else:
+                            new_mn = str(vals).encode()
+                        # 多个 MakerNote 子 IFD：只保留最大的（NEF 第一个才是数据本体）
+                        old = data.get("_raw_makernote", b"")
+                        if len(new_mn) > len(old):
+                            data["_raw_makernote"] = new_mn
                     continue
                 short_name = tag_name.split()[-1] if " " in tag_name else tag_name
                 val = str(tag_value)
@@ -550,6 +575,11 @@ class ExifAnalyzer:
                 except Exception:
                     pass
                 data[short_name] = val
+                # 同时保留含空格键名(如"Image Model"→"Image Model"+"Model"两条)
+                if " " in tag_name and short_name != tag_name:
+                    data[tag_name] = val
+
+            logger.info(f"[相机EXIF] exifread直接解析: {len(tags)} 个标签, 提取 {len(data)} 个有效标签")
 
         except Exception as e:
             logger.warning(f"[相机EXIF] exifread直接解析异常: {e}")
@@ -589,134 +619,223 @@ class ExifAnalyzer:
             data["_rawpy_error"] = str(e)
             return data
 
-    def _extract_shutter_count(
-        self, make: str, makernote_raw: bytes
-    ) -> str | None:
-        """从 MakerNote 中提取快门次数（不依赖 Make/Model 字段）"""
-        # 快门关键词
+    def _extract_makernote_details(self, mn_raw: bytes) -> dict[str, Any]:
+        """解析已提取的 MakerNote 原始字节。不重读文件避免竞争。"""
+        result: dict[str, Any] = {}
+        mn_entries: list[tuple[str, str]] = []
+        binary_makernote: bytes = b""
+        try:
+            if isinstance(mn_raw, bytes) and len(mn_raw) > 10:
+                if HAS_EXIFREAD:
+                    try:
+                        import exifread
+                        from io import BytesIO
+                        tags = exifread.process_file(BytesIO(mn_raw), details=True)
+                        for tag_name, tag_value in tags.items():
+                            if "MakerNote" in tag_name:
+                                continue
+                            short_name = tag_name.split()[-1] if " " in tag_name else tag_name
+                            mn_entries.append((short_name, str(tag_value)))
+                    except Exception:
+                        pass
+                binary_makernote = mn_raw
+
+            logger.info(f"[相机EXIF] MakerNote: {len(mn_entries)}KV + {len(binary_makernote)}B 二进制")
+
+            # 快门次数提取
+            sc = self._find_shutter_count(mn_entries, binary_makernote)
+            if sc:
+                result["shutter_count"] = int(sc)
+
+            # 结构化 MakerNote
+            for k_str, v_str in mn_entries:
+                kl = k_str.lower()
+                for kw, cn in [
+                    ("af_fine_tune", "AF微调"), ("af_tune", "AF微调"),
+                    ("focus_distance", "对焦距离"), ("focus_mode", "对焦模式"),
+                    ("vibration_reduction", "防抖"), ("vr_mode", "防抖模式"),
+                    ("active_d_lighting", "动态D-Lighting"), ("picture_control", "照片调控"),
+                    ("high_iso_nr", "高ISO降噪"), ("lens_type", "镜头类型"),
+                    ("flash_mode", "闪光模式"), ("flash_compensation", "闪光补偿"),
+                ]:
+                    if kw in kl and cn not in result:
+                        result[cn] = v_str
+
+            # 二进制 Nikon MakerNote 额外标签
+            if binary_makernote and len(binary_makernote) > 100:
+                nikon_idx = binary_makernote.find(b"Nikon")
+                if nikon_idx >= 0:
+                    tiff_start = nikon_idx + 8
+                    if tiff_start + 8 < len(binary_makernote):
+                        try:
+                            entries = struct.unpack_from("<H", binary_makernote, tiff_start + 4)[0]
+                            pos = tiff_start + 6
+                            for _ in range(min(entries, 50)):
+                                if pos + 12 > len(binary_makernote):
+                                    break
+                                tag_id, tag_type = struct.unpack_from("<HH", binary_makernote, pos)
+                                if tag_type in (3, 4):
+                                    val = struct.unpack_from("<I", binary_makernote, pos + 8)[0]
+                                    if 100 <= val <= 9999999 and val not in (
+                                        result.get("shutter_count", -1),
+                                    ):
+                                        pass
+                                pos += 12
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.warning(f"[相机EXIF] MakerNote解析异常: {e}")
+
+        return result
+
+    @staticmethod
+    def _find_shutter_count(mn_entries: list, binary_makernote: bytes) -> int | None:
+        """从 MakerNote 提取快门次数（纯函数，无文件 I/O）"""
         SC_KEYWORDS = [
             "shuttercount", "shutter count", "shutter",
             "imagecount", "image count", "image number",
             "totalpictures", "total pictures",
             "totalshutterreleases", "total shutter releases",
-            "totalshutter", "total shutter",
-            "mechanicalshuttercount",
+            "totalshutter", "total shutter", "mechanicalshuttercount",
         ]
 
-        try:
-            import exifread
-            with open(self.file_path, "rb") as f:
-                tags = exifread.process_file(f, details=True)
-
-            mn_entries: list[tuple[str, str]] = []
-            binary_makernote: bytes = b""
-            for tag_name, tag_value in tags.items():
-                if "MakerNote" not in tag_name:
-                    continue
-                if not hasattr(tag_value, "values"):
-                    continue
-                vals = tag_value.values
-                if isinstance(vals, dict):
-                    # dict: 正常 IFD 结构，每个键值对是一个标签
-                    for k, v in vals.items():
-                        mn_entries.append((str(k), str(v)))
-                elif isinstance(vals, (list, tuple)):
-                    # list: 原始二进制 MakerNote，过滤越界字节
+        # 策略1: dict 关键字匹配
+        for k_str, v_str in mn_entries:
+            kl = k_str.lower()
+            for kw in SC_KEYWORDS:
+                if kw in kl:
                     try:
-                        binary_makernote = bytes(vals)
-                    except Exception:
-                        # 处理可能的负数或超大值
-                        filtered = []
-                        for b in vals:
-                            if isinstance(b, int):
-                                filtered.append(b & 0xFF)  # 取低8位
-                            elif isinstance(b, bytes):
-                                filtered.extend(b)
-                        binary_makernote = bytes(filtered) if filtered else b""
-                else:
-                    mn_entries.append(("raw", str(vals)))
+                        return int(float(v_str))
+                    except ValueError:
+                        pass
 
-            logger.info(f"[相机EXIF] MakerNote: {len(mn_entries)}条键值对 + {len(binary_makernote)}字节二进制数据")
-
-            # 策略1: 关键字匹配(仅dict结构的键值对)
-            for k_str, v_str in mn_entries:
-                kl = k_str.lower()
-                for kw in SC_KEYWORDS:
-                    if kw in kl:
+        # 策略2: 厂商标签ID
+        for k_str, v_str in mn_entries:
+            for tag_ids in SHUTTER_COUNT_TAGS.values():
+                for tag_id in tag_ids:
+                    if isinstance(tag_id, int) and str(tag_id) in k_str:
                         try:
-                            return str(int(float(v_str)))
+                            return int(float(v_str))
                         except ValueError:
-                            return v_str
+                            pass
+                    if isinstance(tag_id, str) and tag_id.lower() in k_str.lower():
+                        try:
+                            return int(float(v_str))
+                        except ValueError:
+                            pass
 
-            # 策略2: 厂商标签ID匹配(仅dict结构)
-            for k_str, v_str in mn_entries:
-                for tag_ids in SHUTTER_COUNT_TAGS.values():
-                    for tag_id in tag_ids:
-                        if isinstance(tag_id, int) and str(tag_id) in k_str:
-                            try:
-                                return str(int(float(v_str)))
-                            except ValueError:
-                                return v_str
-                        if isinstance(tag_id, str) and tag_id.lower() in k_str.lower():
-                            try:
-                                return str(int(float(v_str)))
-                            except ValueError:
-                                return v_str
+        # 策略3: Nikon 二进制 0x00A7
+        if binary_makernote and len(binary_makernote) > 100:
+            nikon_idx = binary_makernote.find(b"Nikon")
+            if nikon_idx >= 0:
+                for pattern in [b"\xa7\x00", b"\x00\xa7"]:
+                    pidx = binary_makernote.find(pattern)
+                    if pidx >= 0 and pidx + 12 <= len(binary_makernote):
+                        try:
+                            val = struct.unpack("<I", binary_makernote[pidx+8:pidx+12])
+                            if 100 <= val[0] <= 9999999:
+                                return val[0]
+                            val = struct.unpack(">I", binary_makernote[pidx+8:pidx+12])
+                            if 100 <= val[0] <= 9999999:
+                                return val[0]
+                        except Exception:
+                            pass
 
-            # 策略3: 二进制 NIKON MakerNote 解析
-            # Nikon MakerNote 格式: "Nikon\x00" + TIFF IFD，快门标签 0x00A7
-            if binary_makernote and len(binary_makernote) > 100:
-                # 尝试找到 "Nikon" 头并解析后续 IFD
-                nikon_idx = binary_makernote.find(b"Nikon")
-                if nikon_idx >= 0:
-                    tiff_start = nikon_idx + 8  # 跳过 "Nikon\x00\x01\x00" 或类似头
-                    if tiff_start + 8 < len(binary_makernote):
-                        byte_order = binary_makernote[tiff_start:tiff_start+4]
-                        logger.info(f"[相机EXIF] Nikon MakerNote TIFF头: {byte_order.hex()}")
-                        # 尝试搜索原始字节中的数字模式
-                        text = binary_makernote.decode("latin-1", errors="ignore")
-                        # Nikon 快门通常跟在特定字节模式后
-                        # 搜索 0x00A7 标记附近的数字
-                        for pattern in [b"\xa7\x00", b"\x00\xa7"]:
-                            pidx = binary_makernote.find(pattern)
-                            if pidx >= 0:
-                                nearby = binary_makernote[pidx:pidx+20]
-                                logger.info(f"[相机EXIF] 标签0x00A7在偏移{pidx}, 附近: {nearby.hex()}")
-                                # 尝试解析标签值(Long/SRational)
-                                try:
-                                    val = struct.unpack(">I", binary_makernote[pidx+8:pidx+12])
-                                    if 100 <= val[0] <= 9999999:
-                                        logger.info(f"[相机EXIF] Nikon标签0x00A7解析: {val[0]}")
-                                        return str(val[0])
-                                    val = struct.unpack("<I", binary_makernote[pidx+8:pidx+12])
-                                    if 100 <= val[0] <= 9999999:
-                                        logger.info(f"[相机EXIF] Nikon标签0x00A7(LE)解析: {val[0]}")
-                                        return str(val[0])
-                                except Exception:
-                                    pass
+        # 策略3b: Sony ARW MakerNote ("SONY DSC \x00\x00\x00" + TIFF IFD)
+        if binary_makernote and len(binary_makernote) > 100:
+            sony_idx = binary_makernote.find(b"SONY DSC")
+            if binary_makernote[:6] not in (b"SONY D", b"Nikon\x00"):
+                logger.info(f"[相机EXIF] Makernote前20B hex: {binary_makernote[:20].hex()}")
+            if sony_idx >= 0:
+                logger.info(f"[相机EXIF] Sony MakerNote在偏移{sony_idx}")
+                base = sony_idx + 12  # after "SONY DSC \x00\x00\x00"
+                if base + 8 < len(binary_makernote):
+                    try:
+                        # TIFF header: byte_order(2) + magic(2) + ifd_offset(4)
+                        ifd_offset = struct.unpack_from("<I", binary_makernote, base + 4)[0]
+                        ifd_pos = base + ifd_offset
+                        if ifd_pos + 2 < len(binary_makernote):
+                            entries = struct.unpack_from("<H", binary_makernote, ifd_pos)[0]
+                            pos = ifd_pos + 2
+                            for _ in range(min(entries, 100)):
+                                if pos + 12 > len(binary_makernote):
+                                    break
+                                tag_id = struct.unpack_from("<H", binary_makernote, pos)[0]
+                                if tag_id in (0x9400, 0x9401, 0x9402, 0x9403, 0x940E):
+                                    val = struct.unpack_from("<I", binary_makernote, pos + 8)[0]
+                                    if 100 <= val <= 9999999:
+                                        logger.info(f"[相机EXIF] Sony标签0x{tag_id:04X}解析: {val}")
+                                        return val
+                                pos += 12
+                    except Exception:
+                        pass
 
-        except Exception as e:
-            logger.warning(f"[相机EXIF] 快门次数提取异常: {e}")
-
-        # 备用：从 makernote raw bytes + binary data 中搜索关键词+数字
-        all_raw = (makernote_raw or b"") + binary_makernote if binary_makernote else (makernote_raw or b"")
-        if len(all_raw) > 100:
+        # 策略4: latin-1 全文搜索
+        if len(binary_makernote) > 100:
             try:
-                text = all_raw.decode("latin-1", errors="ignore")
+                text = binary_makernote.decode("latin-1", errors="ignore")
                 for keyword in ["ShutterCount", "ImageCount", "Shutter", "Total"]:
                     idx = text.find(keyword)
-                    if idx >= 0 and idx < len(text) - 5:
-                        snippet = text[idx:idx + 100]
-                        match = re.search(r"(\d{3,7})", snippet)
+                    if 0 <= idx < len(text) - 5:
+                        match = re.search(r"(\d{3,7})", text[idx:idx + 100])
                         if match:
-                            sc = match.group(1)
-                            if 100 <= int(sc) <= 9999999:
-                                logger.info(f"[相机EXIF] 关键词'{keyword}'附近找到: {sc}")
+                            sc = int(match.group(1))
+                            if 100 <= sc <= 9999999:
                                 return sc
             except Exception:
                 pass
 
         return None
+
+    @staticmethod
+    def _extract_xmp_basics(exif_data: dict[str, Any]) -> dict[str, str]:
+        """从 XMLPacket / XMP 数据中提取 CreatorTool、Rating、CreateDate"""
+        xmp = {}
+        raw = exif_data.get("XMLPacket", "")
+        if not raw:
+            return xmp
+        try:
+            for tag, key in [
+                (r"<xmp:CreatorTool>([^<]+)</xmp:CreatorTool>", "CreatorTool"),
+                (r"<xmp:CreateDate>([^<]+)</xmp:CreateDate>", "CreateDate"),
+                (r"<xmp:Rating>([^<]+)</xmp:Rating>", "Rating"),
+            ]:
+                m = re.search(tag, str(raw))
+                if m:
+                    xmp[key] = m.group(1).strip()
+        except Exception:
+            pass
+        return xmp
+
+    @staticmethod
+    def _fill_missing_brand(exif_data: dict[str, Any]) -> None:
+        """通过已知数据反向推断缺失的 Make / Model"""
+        # LensModel 推断品牌
+        lens = (exif_data.get("LensModel") or "").upper()
+        if lens and not exif_data.get("Make"):
+            for kw, brand in [
+                ("NIKKOR", "NIKON CORPORATION"),
+                ("CANON EF", "Canon"), ("EF-S", "Canon"), ("RF", "Canon"),
+                ("E ", "SONY"), ("FE ", "SONY"),
+                ("FUJINON", "FUJIFILM"), ("XF", "FUJIFILM"),
+                ("M.ZUIKO", "OLYMPUS"),
+            ]:
+                if kw in lens:
+                    exif_data["Make"] = brand
+                    break
+        # 缺失 Model: 回退 + 日志（EXIF 可能把 Model 存为键名含空格的格式）
+        if not exif_data.get("Model"):
+            for key in ("Image Model", "EXIF Model",
+                         "UniqueCameraModel", "LocalizedCameraModel",
+                         "CameraModel", "Model"):
+                val = exif_data.get(key, "")
+                if val and 3 < len(val) < 100:
+                    exif_data["Model"] = val
+                    logger.info(f"[相机EXIF] Model回退自'{key}': {val}")
+                    break
+        if not exif_data.get("Model"):
+            logger.info(f"[相机EXIF] Model缺失: Make={exif_data.get('Make','')}, "
+                       f"候选键={[k for k in exif_data if 'model' in k.lower() or 'camera' in k.lower()]}")
 
     def _extract_gps(self, exif_data: dict[str, Any]) -> dict[str, Any]:
         """提取并格式化 GPS 信息"""
@@ -956,45 +1075,133 @@ class ExifAnalyzer:
             lines.append("⚠️ 该图片不含相机EXIF数据")
             return "\n".join(lines)
 
-        # 所有字段（按分类分组）
-        categories = [
-            ("📷 相机信息", ["Make", "Model", "BodySerialNumber", "SerialNumber"]),
-            ("🔭 镜头信息", ["LensModel", "LensMake"]),
-            ("⚙️ 拍摄参数", [
-                "FocalLength", "FocalLengthIn35mmFilm", "FNumber",
-                "ExposureTime", "ISOSpeedRatings", "ExposureBiasValue",
-                "ExposureProgram", "ExposureMode",
-            ]),
-            ("🎯 高级设置", [
-                "MeteringMode", "WhiteBalance", "Flash",
-                "ColorSpace", "SceneCaptureType",
-            ]),
-            ("🖼️ 图片属性", [
-                "ImageWidth", "ImageLength", "Orientation",
-                "Software",
-            ]),
-            ("📅 时间信息", [
-                "DateTimeOriginal", "DateTimeDigitized", "DateTime",
-            ]),
-            ("👤 版权信息", ["Artist", "Copyright"]),
-        ]
+        # ── 器材 ──
+        make = exif.get("Make", "")
+        model = exif.get("Model", "")
+        lens = exif.get("LensModel", "")
+        body = make + " " + model if make or model else ""
+        camera_line = body.strip()
+        if lens:
+            camera_line += (", " + lens.strip()) if camera_line else lens.strip()
+        if camera_line:
+            lines.append("─" * 36)
+            lines.append("📷 器材")
+            lines.append(f"  {camera_line}")
+        sn = exif.get("BodySerialNumber") or exif.get("SerialNumber")
+        if sn:
+            lines.append(f"  机身序列号: {sn}")
 
-        for cat_name, tags in categories:
-            items = []
-            for tag in tags:
-                val = exif.get(tag, "")
-                if val:
-                    cn = ExifAnalyzer.TAG_NAMES_CN.get(tag, tag)
-                    items.append(f"  {cn}: {val}")
-            if items:
-                lines.append("─" * 36)
-                lines.append(cat_name)
-                lines.extend(items)
+        # ── 模式 ──
+        mode_items = []
+        ep = exif.get("ExposureProgram", "")
+        if ep:
+            mode_items.append(f"曝光模式:{ep}")
+        mm = exif.get("MeteringMode", "")
+        if mm:
+            mode_items.append(f"测光模式:{mm}")
+        ev = exif.get("ExposureBiasValue", "")
+        if ev:
+            mode_items.append(f"曝光补偿:{ev}")
+        if mode_items:
+            lines.append("─" * 36)
+            lines.append("🎯 模式")
+            lines.append(f"  {', '.join(mode_items)}")
 
-        # 快门次数
+        # ── 曝光 ──
+        exp_items = []
+        fn = exif.get("FNumber", "")
+        if fn:
+            exp_items.append(f"光圈:{fn}")
+        et = exif.get("ExposureTime", "")
+        if et:
+            exp_items.append(f"快门:{et}秒")
+        iso = exif.get("ISOSpeedRatings", "")
+        if iso:
+            exp_items.append(f"ISO{iso}")
+        if exp_items:
+            lines.append("─" * 36)
+            lines.append("⚙️ 曝光")
+            lines.append(f"  {', '.join(exp_items)}")
+
+        # ── 焦距 ──
+        fl = exif.get("FocalLength", "")
+        fl35 = exif.get("FocalLengthIn35mmFilm", "")
+        if fl:
+            fl_text = f"焦距: {fl} mm"
+            if fl35:
+                fl_text += f" (35mm等效: {fl35} mm)"
+                # 计算视角: 2*atan(43.27/(2*fl35)) * 180/π
+                try:
+                    fl35_val = float(fl35)
+                    angle = 2 * math.atan(43.27 / (2 * fl35_val)) * 180 / math.pi
+                    fl_text += f", 视角:{angle:.1f}°"
+                except Exception:
+                    pass
+            lines.append(f"  {fl_text}")
+
+        # ── 色彩 ──
+        color_items = []
+        wb = exif.get("WhiteBalance", "")
+        if wb:
+            color_items.append(f"白平衡:{wb}")
+        cs = exif.get("ColorSpace", "")
+        if cs:
+            color_items.append(f"色彩空间:{cs}")
+        if color_items:
+            lines.append("─" * 36)
+            lines.append("🎨 色彩")
+            lines.append(f"  {', '.join(color_items)}")
+
+        # ── 时间 ──
+        dt = exif.get("DateTimeOriginal", "")
+        subsec = exif.get("SubSecTimeOriginal", "")
+        if dt:
+            time_str = dt.strip()
+            if subsec:
+                time_str += f".{subsec.rstrip()}"
+            lines.append("─" * 36)
+            lines.append("📅 时间")
+            lines.append(f"  {time_str}")
+        elif dt2 := exif.get("DateTime", ""):
+            lines.append("─" * 36)
+            lines.append("📅 时间")
+            lines.append(f"  {dt2}")
+
+        # ── 快门次数 ──
         if sc:
             lines.append("─" * 36)
             lines.append(f"📷 快门次数: {sc}")
+
+        # ── 闪光灯 ──
+        flash = exif.get("Flash", "")
+        if flash:
+            lines.append("─" * 36)
+            lines.append(f"💡 闪光灯: {flash}")
+
+        # ── 图片属性 ──
+        w = exif.get("ImageWidth", "")
+        h = exif.get("ImageLength", "")
+        orient = exif.get("Orientation", "")
+        sw = exif.get("Software", "")
+        if w and h:
+            lines.append("─" * 36)
+            lines.append("🖼️ 图片属性")
+            lines.append(f"  尺寸: {w} × {h} px")
+            if orient:
+                lines.append(f"  方向: {orient}")
+            if sw:
+                lines.append(f"  软件: {sw}")
+
+        # ── 版权 ──
+        artist = exif.get("Artist", "")
+        copyright = exif.get("Copyright", "")
+        if artist or copyright:
+            lines.append("─" * 36)
+            lines.append("👤 版权信息")
+            if artist:
+                lines.append(f"  作者: {artist}")
+            if copyright:
+                lines.append(f"  版权: {copyright}")
 
         # GPS
         if gps:
@@ -1006,11 +1213,36 @@ class ExifAnalyzer:
             if gps.get("map_url"):
                 lines.append(f"  🗺️ {gps['map_url']}")
 
-        # 其他所有未列出的标签（超长字段截断，避免 XML/XMP 撑爆消息）
-        all_listed = set()
-        for _, tags in categories:
-            all_listed.update(tags)
-        others = {k: v for k, v in exif.items() if k not in all_listed and not k.startswith("_") and not k.startswith("GPS") and k not in ("MakerNote", "UserComment")}
+        # XMP 信息
+        xmp = result.get("xmp", {})
+        if xmp:
+            lines.append("─" * 36)
+            lines.append("📝 XMP信息:")
+            for k in ("CreatorTool", "CreateDate", "Rating"):
+                if xmp.get(k):
+                    lines.append(f"  {k}: {xmp[k]}")
+
+        # MakerNote 详细信息
+        mn = result.get("maker_note", {})
+        if mn:
+            shown = {k: v for k, v in mn.items() if k != "shutter_count" and v}
+            if shown:
+                lines.append("─" * 36)
+                lines.append("🔧 相机内部信息:")
+                for k, v in shown.items():
+                    lines.append(f"  {k}: {v}")
+
+        # 其他未归类标签（超长字段截断）
+        listed = {"Make", "Model", "LensModel", "BodySerialNumber", "SerialNumber",
+                  "ExposureProgram", "MeteringMode", "ExposureBiasValue",
+                  "FNumber", "ExposureTime", "ISOSpeedRatings",
+                  "FocalLength", "FocalLengthIn35mmFilm",
+                  "WhiteBalance", "ColorSpace", "DateTimeOriginal", "DateTime",
+                  "SubSecTimeOriginal", "Flash", "ImageWidth", "ImageLength",
+                  "Orientation", "Software", "Artist", "Copyright",
+                  "SceneCaptureType", "ExposureMode", "LensMake", "LensSerialNumber",
+                  "XMLPacket", "_raw_makernote"}
+        others = {k: v for k, v in exif.items() if k not in listed and not k.startswith("_") and not k.startswith("GPS") and k not in ("MakerNote", "UserComment")}
         if others:
             lines.append("─" * 36)
             lines.append("📋 其他标签:")
@@ -1240,19 +1472,39 @@ class CameraExifPlugin(Star):
 
     @staticmethod
     async def _make_preview(file_path: str) -> str | None:
-        """生成原尺寸压缩图，返回临时文件路径。失败返回 None。"""
+        """生成预览图。RAW 文件用 rawpy 提取全尺寸图像，普通图片直接压缩。
+        返回临时 JPEG 文件路径，失败返回 None。"""
         try:
             from PIL import Image as PILImage
             from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
-            img = PILImage.open(file_path)
-            if hasattr(img, "n_frames") and img.n_frames > 1:
-                img.seek(0)
+
+            ext = os.path.splitext(file_path)[1].lower()
             thumb_path = os.path.join(get_astrbot_temp_path(), f"thumb_{uuid.uuid4().hex[:8]}.jpg")
+
+            # RAW 文件：用 rawpy 提取全分辨率图像
+            if ext in RAW_EXTENSIONS and HAS_RAWPY:
+                import rawpy
+                loop = asyncio.get_event_loop()
+                img_array = await loop.run_in_executor(
+                    None, _extract_raw_preview_rawpy, file_path
+                )
+                if img_array is not None:
+                    np_array = img_array  # (H, W, 3) numpy array
+                    img = PILImage.fromarray(np_array)
+                    img.save(thumb_path, "JPEG", quality=70)
+                    img.close()
+                    size_mb = os.path.getsize(thumb_path) / (1024 * 1024)
+                    logger.info(f"[相机EXIF] 预览图(rawpy): {thumb_path} ({size_mb:.1f}MB)")
+                    return thumb_path
+
+            # RAW 回退 / 普通图片：PIL 直接打开
+            img = PILImage.open(file_path)
             img.convert("RGB").save(thumb_path, "JPEG", quality=70)
             img.close()
             size_mb = os.path.getsize(thumb_path) / (1024 * 1024)
             logger.info(f"[相机EXIF] 预览图生成: {thumb_path} ({size_mb:.1f}MB)")
             return thumb_path
+
         except Exception as e:
             logger.warning(f"[相机EXIF] 预览图生成失败: {e}")
             return None

@@ -10,11 +10,11 @@ AstrBot 相机图片 EXIF 元数据自动检测与解析插件。
 
 - 🔍 **自动检测**：接收图片后自动分析 EXIF，无需手动触发
 - 📊 **19 种字段指令**：独立查询快门次数、光圈、焦距、ISO 等
-- 🎯 **快门次数**：支持 Nikon / Canon / Sony 等品牌快门计数提取
-- 📸 **RAW 格式**：支持 CR2/CR3/NEF/ARW/RAF/DNG/ORF 等 20+ 种 RAW
+- 🎯 **快门次数**：Nikon / Canon / Sony / Fujifilm / Olympus / Pentax / Panasonic 等全品牌
+- 📸 **RAW 全尺寸预览**：rawpy 提取 RAW 全分辨率图像（非 160×120 缩略图）
+- 📋 **紧凑显示**：器材/模式/曝光/焦距/色彩/时间/GPS/XMP 分类展示
 - 🔐 **权限隔离**：每人只能查自己发的图，A 群图片 B 群不可查
-- 🖼️ **图片预览**：可选附带原尺寸压缩预览图
-- 📤 **转发模式**：支持合并转发，外显自定义名称
+- 📤 **转发模式**：支持 QQ 合并转发，外显自定义名称
 - ⏳ **等待模式**：输入指令后等待发图，超时自动退出
 - 🛡️ **安全**：频率限制、黑白名单、路径校验、分析超时
 
@@ -41,7 +41,7 @@ AstrBot 相机图片 EXIF 元数据自动检测与解析插件。
 | `/光圈` | `/光圈值` `/aperture` `/fnumber` | 光圈值 |
 | `/ISO` | `/iso` `/感光度` `/ISO查询` | ISO感光度 |
 | `/测光模式` | `/测光` `/metering` | 测光模式 |
-| `/曝光模式` | `/曝光` `/exposure` | 曝光模式(手动/光圈优先等) |
+| `/曝光模式` | `/曝光` `/exposure` | 曝光模式 |
 | `/曝光补偿` | `/EV` `/ev` | 曝光补偿值 |
 | `/闪光灯` | `/闪光` `/flash` | 闪光灯状态 |
 | `/白平衡` | `/whitebalance` `/wb` | 白平衡设置 |
@@ -54,7 +54,49 @@ AstrBot 相机图片 EXIF 元数据自动检测与解析插件。
 ### 使用方式
 1. `[图片] /exif` — 发送图片的同时附带指令
 2. `[引用图片] /exif` — @引用已发送的图片后输入指令
-3. `/exif` → 等待图片 — 先输入指令，再发图片（可配置超时）
+3. `/exif` → 等待图片 — 先输入指令，再发图片（超时 120s）
+
+---
+
+## 📋 EXIF 显示格式
+
+```
+📸 完整 EXIF 元数据
+════════════════════════════════════
+文件: DSC_2095.NEF (Nikon NEF)
+大小: 28.52 MB
+────────────────────────────────────
+📷 器材
+  NIKON CORPORATION NIKON Z 6_2, NIKKOR Z 24-50mm f/4-6.3
+  机身序列号: 10000000
+────────────────────────────────────
+🎯 模式
+  曝光模式:Manual, 测光模式:Spot, 曝光补偿:0
+────────────────────────────────────
+⚙️ 曝光
+  光圈:63/10, 快门:1/100秒, ISO1250
+────────────────────────────────────
+  焦距: 45.0 mm (35mm等效: 45.0 mm), 视角:51.3°
+────────────────────────────────────
+🎨 色彩
+  白平衡:Auto, 色彩空间:sRGB
+────────────────────────────────────
+📅 时间
+  2026:04:30 22:05:53.62
+────────────────────────────────────
+📷 快门次数: 1925
+────────────────────────────────────
+🖼️ 图片属性
+  尺寸: 6048 × 4024 px
+  软件: Ver.01.70
+────────────────────────────────────
+👤 版权信息
+  作者: HAOTIANSHOUWANG_1484475153
+────────────────────────────────────
+📝 XMP信息:
+  CreatorTool: NIKON Z 6_2 Ver.01.70
+  Rating: 0
+```
 
 ---
 
@@ -66,11 +108,11 @@ AstrBot 相机图片 EXIF 元数据自动检测与解析插件。
 | `auto_detect_enabled` | bool | true | 启用自动检测 |
 | `max_image_size_mb` | int | 50 | 最大处理图片大小(MB) |
 | `wait_timeout_seconds` | int | 120 | 等待图片超时(秒) |
-| `reply_mode` | select | 文本发送 | 回复模式：文本发送/转发发送/不发送 |
+| `reply_mode` | select | 文本发送 | 文本发送/转发发送/不发送 |
 | `forward_display_name` | string | 相机EXIF分析 | 转发显示名称 |
 | `allow_reference_query` | bool | false | 允许引用查询他人图片 |
 | `show_analyzing_hint` | bool | true | 显示"正在分析..."提示 |
-| `send_preview_thumbnail` | bool | false | 发送图片预览缩略图 |
+| `send_preview_thumbnail` | bool | false | 发送全尺寸预览图 |
 | `show_detailed_exif_default` | bool | false | 默认显示详细EXIF |
 | `group_chat_filter` | object | — | 群聊黑白名单 |
 | `private_chat_filter` | object | — | 私聊黑白名单 |
@@ -79,12 +121,12 @@ AstrBot 相机图片 EXIF 元数据自动检测与解析插件。
 
 ## 🔐 权限与安全
 
-- **用户隔离**：A 发送的图片，B 在 B 群无法查询
+- **用户隔离**：A 发送的图片，B 无法跨用户查询
 - **跨群隔离**：A 群图片不能在 B 群查询
-- **引用控制**：关闭 `allow_reference_query` 后别人无法引用你的图片查 EXIF
-- **频率限制**：10 秒内自动检测最多 3 次，指令最多 5 次
+- **引用控制**：`allow_reference_query=false` 时别人无法引用你的图片
+- **频率限制**：10s 内自动检测≤3 次，指令≤5 次
 - **路径安全**：图片清理仅限 AstrBot temp 目录
-- **分析超时**：单次分析 45 秒超时保护
+- **分析超时**：单次 45s 超时保护
 
 ---
 
@@ -95,11 +137,9 @@ cd AstrBot/data/plugins
 git clone https://github.com/haotianshouwang/astrbot_plugin_camera_exif.git
 cd astrbot_plugin_camera_exif
 pip install -r requirements.txt
-# 可选：RAW 深度解析
-pip install rawpy
+# 可选：RAW 全尺寸预览
+pip install rawpy numpy
 ```
-
-在 WebUI → 插件管理 中重载插件即可使用。
 
 ---
 
@@ -112,13 +152,30 @@ pip install rawpy
 
 ---
 
+## 🧪 测试状态
+
+⚠️ 个人能力有限，目前仅测试以下机型：
+
+| 品牌 | 机型 | JPG | RAW | 快门 |
+|------|------|-----|-----|------|
+| Nikon | Z6 II | ✅ | ✅ NEF | ✅ 2493 |
+| Canon | 80D | ✅ | ⚠️ CR2 | ⚠️ |
+| Sony | A7M5 | ✅ | ⚠️ ARW | ⚠️ |
+
+> Sony ARW 快门方案已编码，无实机验证。其他品牌因器材不足未深度测试，**理论上均支持**。
+
+🙏 **欢迎网友帮忙测试并提交 PR 反馈！** 如遇解析不全或快门获取失败，请在 [GitHub Issues](https://github.com/haotianshouwang/astrbot_plugin_camera_exif/issues) 提供机型+样片。
+
+---
+
 ## 🧪 依赖
 
 | 库 | 必需 | 用途 |
 |----|------|------|
 | Pillow | ✅ | 基础 EXIF 提取 |
 | exifread | ✅ | 详细 MakerNote 解析 |
-| rawpy | ❌ | RAW 文件深度解析（可选） |
+| rawpy | ❌ | RAW 全尺寸预览（可选） |
+| numpy | ❌ | rawpy 依赖（可选） |
 
 ---
 
@@ -128,4 +185,4 @@ pip install rawpy
 
 ## 📄 许可证
 
-MIT License
+本插件允许二次修改和非商业使用（CC BY-NC 4.0）。**禁止商用**
