@@ -29,6 +29,12 @@
     "hint": "仅输入指令未传图片时进入等待模式，超时自动退出。设为 0 则关闭等待模式",
     "default": 120
   },
+  "text_chunk_interval": {
+    "description": "文本分片发送间隔(秒)",
+    "type": "float",
+    "hint": "文本模式下长EXIF分片发送时每片之间的间隔秒数，防刷屏。设为 0 则不间隔",
+    "default": 1.0
+  },
   "reply_mode": {
     "description": "💬 回复模式",
     "type": "string",
