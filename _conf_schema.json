@@ -23,6 +23,49 @@
     "hint": "超过此大小的图片将跳过EXIF分析，RAW文件建议设置较大值(如50)",
     "default": 50
   },
+  "wait_timeout_seconds": {
+    "description": "等待图片超时(秒)",
+    "type": "int",
+    "hint": "仅输入指令未传图片时进入等待模式，超时自动退出。设为 0 则关闭等待模式",
+    "default": 120
+  },
+  "reply_mode": {
+    "description": "💬 回复模式",
+    "type": "string",
+    "hint": "选择检测到相机图片后的回复方式",
+    "options": ["文本发送", "转发发送", "不发送"],
+    "default": "文本发送"
+  },
+  "forward_display_name": {
+    "description": "转发显示名称(仅转发发送模式)",
+    "type": "string",
+    "hint": "转发发送模式下在QQ显示的自定义名称",
+    "default": "相机EXIF分析"
+  },
+  "allow_reference_query": {
+    "description": "允许引用查询他人图片",
+    "type": "bool",
+    "hint": "开启后别人可@引用你的图+指令查EXIF；关闭后仅原发送者可引用自己的图，别人引用查不到",
+    "default": false
+  },
+  "show_analyzing_hint": {
+    "description": "显示分析中提示",
+    "type": "bool",
+    "hint": "分析完成后显示'正在分析...'提示",
+    "default": true
+  },
+  "send_preview_thumbnail": {
+    "description": "发送图片预览缩略图",
+    "type": "bool",
+    "hint": "开启后在EXIF信息后面附带一张图片缩略预览图（约300px宽）。RAW文件也能提取内嵌预览",
+    "default": false
+  },
+  "show_detailed_exif_default": {
+    "description": "默认显示详细EXIF",
+    "type": "bool",
+    "hint": "开启后自动检测回复默认显示完整EXIF，关闭则显示摘要",
+    "default": false
+  },
   "display_fields": {
     "description": "📋 自定义显示字段",
     "type": "object",
@@ -194,36 +237,5 @@
         "default": []
       }
     }
-  },
-  "reply_mode": {
-    "description": "💬 回复模式",
-    "type": "string",
-    "hint": "选择检测到相机图片后的回复方式",
-    "options": ["文本发送", "转发发送", "不发送"],
-    "default": "文本发送"
-  },
-  "forward_display_name": {
-    "description": "转发显示名称(仅转发发送模式)",
-    "type": "string",
-    "hint": "转发发送模式下在QQ显示的自定义名称",
-    "default": "相机EXIF分析"
-  },
-  "allow_reference_query": {
-    "description": "允许引用查询他人图片",
-    "type": "bool",
-    "hint": "开启后别人可@引用你的图+指令查EXIF；关闭后仅原发送者可引用自己的图，别人引用查不到",
-    "default": false
-  },
-  "show_analyzing_hint": {
-    "description": "显示分析中提示",
-    "type": "bool",
-    "hint": "分析完成后显示'正在分析...'提示",
-    "default": true
-  },
-  "show_detailed_exif_default": {
-    "description": "默认显示详细EXIF",
-    "type": "bool",
-    "hint": "开启后自动检测回复默认显示完整EXIF，关闭则显示摘要",
-    "default": false
   }
 }

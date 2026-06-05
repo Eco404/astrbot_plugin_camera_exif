@@ -15,6 +15,7 @@ import re
 import struct
 import sys
 import time
+import uuid
 from collections.abc import AsyncGenerator
 from datetime import datetime
 from pathlib import Path
@@ -620,11 +621,18 @@ class ExifAnalyzer:
                     for k, v in vals.items():
                         mn_entries.append((str(k), str(v)))
                 elif isinstance(vals, (list, tuple)):
-                    # list: 原始二进制 MakerNote(Nikon/Sony等)，不逐字节处理
+                    # list: 原始二进制 MakerNote，过滤越界字节
                     try:
                         binary_makernote = bytes(vals)
                     except Exception:
-                        binary_makernote = b"".join(bytes([int(b) if isinstance(b, int) else b]) if isinstance(b, int) else b for b in vals if isinstance(b, (int, bytes)))
+                        # 处理可能的负数或超大值
+                        filtered = []
+                        for b in vals:
+                            if isinstance(b, int):
+                                filtered.append(b & 0xFF)  # 取低8位
+                            elif isinstance(b, bytes):
+                                filtered.extend(b)
+                        binary_makernote = bytes(filtered) if filtered else b""
                 else:
                     mn_entries.append(("raw", str(vals)))
 
@@ -998,7 +1006,7 @@ class ExifAnalyzer:
             if gps.get("map_url"):
                 lines.append(f"  🗺️ {gps['map_url']}")
 
-        # 其他所有未列出的标签
+        # 其他所有未列出的标签（超长字段截断，避免 XML/XMP 撑爆消息）
         all_listed = set()
         for _, tags in categories:
             all_listed.update(tags)
@@ -1008,7 +1016,10 @@ class ExifAnalyzer:
             lines.append("📋 其他标签:")
             for k, v in others.items():
                 cn = ExifAnalyzer.TAG_NAMES_CN.get(k, k)
-                lines.append(f"  {cn}: {v}")
+                val_str = str(v)
+                if len(val_str) > 200:
+                    val_str = val_str[:200] + f"... (截断, 共{len(val_str)}字)"
+                lines.append(f"  {cn}: {val_str}")
 
         return "\n".join(lines)
 
@@ -1109,12 +1120,12 @@ class CameraExifPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
         self.config: AstrBotConfig = config
-        # 权限隔离缓存: {"{platform}:{type}:{session_id}::{user_id}" → {"result":..., "timestamp":...}}
         self._last_results: dict[str, dict[str, Any]] = {}
         self._max_cache_size = 200
-        # 频率限制: {user_id: [timestamps]}
         self._rate_limits: dict[str, list[float]] = {}
         self._cmd_rate_limits: dict[str, list[float]] = {}
+        # 等待模式: {user_id: (expiry_timestamp, field_key, cn_name)}
+        self._waiting_for_image: dict[str, tuple[float, str, str]] = {}
 
     # ── 生命周期 ──
 
@@ -1204,14 +1215,47 @@ class CameraExifPlugin(Star):
                 return False, "您在黑名单中"
             return True, ""
 
-    def _format_reply(self, event: AstrMessageEvent, text: str) -> MessageChain:
-        """根据 reply_mode 配置生成回复消息"""
+    def _format_reply(self, event: AstrMessageEvent, text: str, thumb_path: str | None = None) -> list:
+        """生成回复消息列表。转发模式下图文合一，文本模式分开发。"""
+        results = []
         reply_mode = self.config.get("reply_mode", "文本发送")
         forward_name = self.config.get("forward_display_name", "相机EXIF分析")
+        logger.info(f"[相机EXIF] _format_reply: reply_mode={reply_mode!r}")
         if reply_mode == "转发发送":
-            node = Node(uin=str(event.get_self_id() or "10000"), name=forward_name, content=[MsgPlain(text)])
-            return event.chain_result([node])
-        return event.plain_result(text)
+            contents: list = [MsgPlain(text)]
+            if thumb_path and os.path.isfile(thumb_path):
+                contents.append(MsgPlain("\n🖼️[图片预览]"))
+                contents.append(CompImage.fromFileSystem(thumb_path))
+            node = Node(uin=str(event.get_self_id() or "10000"), name=forward_name, content=contents)
+            results.append(event.chain_result([node]))
+        else:
+            results.append(event.plain_result(text))
+            if thumb_path and os.path.isfile(thumb_path):
+                logger.info(f"[相机EXIF] 发送预览图: {os.path.basename(thumb_path)}")
+                results.append(event.plain_result("🖼️[图片预览]"))
+                results.append(event.make_result().file_image(thumb_path))
+        return results
+
+    # ── 缩略图生成 ──
+
+    @staticmethod
+    async def _make_preview(file_path: str) -> str | None:
+        """生成原尺寸压缩图，返回临时文件路径。失败返回 None。"""
+        try:
+            from PIL import Image as PILImage
+            from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
+            img = PILImage.open(file_path)
+            if hasattr(img, "n_frames") and img.n_frames > 1:
+                img.seek(0)
+            thumb_path = os.path.join(get_astrbot_temp_path(), f"thumb_{uuid.uuid4().hex[:8]}.jpg")
+            img.convert("RGB").save(thumb_path, "JPEG", quality=70)
+            img.close()
+            size_mb = os.path.getsize(thumb_path) / (1024 * 1024)
+            logger.info(f"[相机EXIF] 预览图生成: {thumb_path} ({size_mb:.1f}MB)")
+            return thumb_path
+        except Exception as e:
+            logger.warning(f"[相机EXIF] 预览图生成失败: {e}")
+            return None
 
     # ── 文件类型检测 ──
 
@@ -1302,18 +1346,21 @@ class CameraExifPlugin(Star):
             return None
 
     async def _analyze_and_reply_image(
-        self, event: AstrMessageEvent, file_path: str, show_analyzing: bool = False
+        self, event: AstrMessageEvent, file_path: str,
+        show_analyzing: bool = False, notify_no_exif: bool = False,
     ) -> AsyncGenerator[MessageChain, None]:
-        """分析图片并生成回复。分析完才判断是否为相机图片，避免误提示。"""
-        # 先分析
+        """分析图片并生成回复。notify_no_exif=True 时非相机图片也会提示。"""
         result = await self._analyze_image(file_path, event)
         if not result:
             self._cleanup_temp_image(file_path)
+            if notify_no_exif:
+                yield event.plain_result("⚠️ 图片分析失败，请重试")
             return
 
-        # 非相机图片 → 静默跳过
         if not result.get("is_camera_image"):
             self._cleanup_temp_image(file_path)
+            if notify_no_exif:
+                yield event.plain_result("⚠️ 该图片不包含 EXIF 信息（截图/网图等非相机拍摄图片）")
             return
 
         # 确认是相机图片后才发提示
@@ -1332,10 +1379,58 @@ class CameraExifPlugin(Star):
         if result.get("gps") and fields.get("gps", False):
             text += "\n\n🔒 GPS位置信息已显示，请注意隐私保护"
 
-        # 回复格式
-        yield self._format_reply(event, text)
+        # 生成缩略图
+        thumb_path = None
+        if self.config.get("send_preview_thumbnail", False):
+            thumb_path = await self._make_preview(file_path)
+
+        # 发消息
+        for r in self._format_reply(event, text, thumb_path):
+            yield r
 
         self._cleanup_temp_image(file_path)
+
+    # ── 结果回复（含预览图） ──
+
+    async def _reply_result(self, event: AstrMessageEvent, file_path: str,
+                            mode: str, field_key: str = "", cn_name: str = ""):
+        """分析图片并回复：消息1=EXIF文本, 消息2=预览图"""
+        result = await self._analyze_image(file_path, event)
+        if not result:
+            self._cleanup_temp_image(file_path)
+            return
+
+        # 预览图（必须在清理前生成）
+        thumb_path = None
+        if self.config.get("send_preview_thumbnail", False):
+            thumb_path = await self._make_preview(file_path)
+
+        self._cleanup_temp_image(file_path)
+
+        # 消息1：文本
+        if mode == "full":
+            text = ExifAnalyzer.format_full_exif_text(result)
+        else:
+            exif = result.get("exif_data", {})
+            if field_key == "shutter_count":
+                text = f"📷 {cn_name}: {result.get('shutter_count') or '无法获取'}"
+            elif field_key == "image_size":
+                text = f"🖼️ {cn_name}: {exif.get('ImageWidth','?')} × {exif.get('ImageLength','?')} px"
+            elif field_key == "gps":
+                gps = result.get("gps", {})
+                if gps:
+                    lines = [f"📍 {cn_name}:"]
+                    for k, v in gps.items():
+                        if k != "map_url" and v: lines.append(f"  {k}: {v}")
+                    if gps.get("map_url"): lines.append(f"  🗺️ {gps['map_url']}")
+                    text = "\n".join(lines)
+                else:
+                    text = "📍 该图片无GPS信息"
+            else:
+                val = exif.get(field_key, "")
+                text = f"📸 {cn_name}: {val}" if val else f"⚠️ 该图片未包含{cn_name}信息"
+        for r in self._format_reply(event, text, thumb_path):
+            yield r
 
     # ── 消息处理 ──
 
@@ -1455,24 +1550,15 @@ class CameraExifPlugin(Star):
             yield event.plain_result("⚠️ 查询过于频繁，请稍后再试")
             return
 
-        # 尝试从事件获取图片并分析
+        # 尝试从事件获取图片并分析（直接图片 或 引用图片）
         file_path = await self._get_image_path_from_event(event)
         if file_path:
-            result = await self._analyze_image(file_path, event)
-            self._cleanup_temp_image(file_path)
-            if result:
-                yield self._format_reply(event, ExifAnalyzer.format_full_exif_text(result))
-                event.stop_event()
-                return
-
-        # 从缓存获取
-        cached = self._get_cached_result(event)
-        if cached:
-            yield self._format_reply(event, ExifAnalyzer.format_full_exif_text(cached))
+            async for r in self._reply_result(event, file_path, "full", ""):
+                yield r
             event.stop_event()
             return
 
-        # 权限提示：引用了别人的图片但被拦截
+        # 权限提示
         if self._is_blocked_reference(event):
             yield event.plain_result(
                 "🔒 这不是你发送的图片哦~\n"
@@ -1480,8 +1566,15 @@ class CameraExifPlugin(Star):
             )
             return
 
+        # 进入等待模式（全字段）
+        timeout = self.config.get("wait_timeout_seconds", 120)
+        if timeout <= 0:
+            yield event.plain_result("⚠️ 请发送图片或@引用图片后再使用 /exif")
+            return
+        self._waiting_for_image[event.get_sender_id()] = (time.time() + timeout, "", "完整EXIF")
         yield event.plain_result(
-            "⚠️ 未找到可查询的图片\n请先发送图片再使用 /exif"
+            "⚠️ 请发送图片或@引用图片后再使用 /exif\n"
+            f"⏳ 请在 {timeout} 秒内发送图片，超时自动退出检测"
         )
 
     # ================================================================
@@ -1533,7 +1626,7 @@ class CameraExifPlugin(Star):
         return None
 
     async def _query_field(self, event: AstrMessageEvent, field_key: str, cn_name: str):
-        """通用字段查询：下载图片→分析→提取指定字段→回复"""
+        """通用字段查询：图片→分析→提取字段→回复（必须带图片，不查缓存）"""
         allowed, reason = self._check_access(event)
         if not allowed:
             yield event.plain_result(f"⚠️ {reason}")
@@ -1544,55 +1637,28 @@ class CameraExifPlugin(Star):
 
         # 尝试从事件获取图片并分析
         file_path = await self._get_image_path_from_event(event)
-        result = None
         if file_path:
-            result = await self._analyze_image(file_path, event)
-            self._cleanup_temp_image(file_path)
-
-        # 如果无图片或分析失败，从缓存取
-        if not result:
-            result = self._get_cached_result(event)
-
-        if not result:
-            if self._is_blocked_reference(event):
-                yield event.plain_result(
-                    "🔒 这不是你发送的图片哦~\n"
-                    "主人没有开放别人查看其他人的 EXIF 信息呢"
-                )
-            else:
-                yield event.plain_result(f"⚠️ 未找到可查询的图片，请先发送图片再 /{cn_name}")
+            async for r in self._reply_result(event, file_path, "field", field_key, cn_name):
+                yield r
+            event.stop_event()
             return
 
-        exif = result.get("exif_data", {})
-
-        # 提取指定字段
-        if field_key == "shutter_count":
-            sc = result.get("shutter_count") or "无法获取"
-            yield event.plain_result(f"📷 快门次数: {sc}")
-        elif field_key == "image_size":
+        # 无图片 → 等待模式或提示
+        if self._is_blocked_reference(event):
             yield event.plain_result(
-                f"🖼️ {cn_name}: {exif.get('ImageWidth', '?')} × {exif.get('ImageLength', '?')} px"
+                "🔒 这不是你发送的图片哦~\n"
+                "主人没有开放别人查看其他人的 EXIF 信息呢"
             )
-        elif field_key == "gps":
-            gps = result.get("gps", {})
-            if gps:
-                lines = [f"📍 {cn_name}:"]
-                for k, v in gps.items():
-                    if k != "map_url" and v:
-                        lines.append(f"  {k}: {v}")
-                if gps.get("map_url"):
-                    lines.append(f"  🗺️ {gps['map_url']}")
-                yield event.plain_result("\n".join(lines))
-            else:
-                yield event.plain_result("📍 该图片无GPS信息")
+            return
+        timeout = self.config.get("wait_timeout_seconds", 120)
+        if timeout <= 0:
+            yield event.plain_result(f"⚠️ 请发送图片或@引用图片后再使用 /{cn_name}")
         else:
-            val = exif.get(field_key, "")
-            if val:
-                yield event.plain_result(f"📸 {cn_name}: {val}")
-            else:
-                yield event.plain_result(f"⚠️ 该图片未包含{cn_name}信息")
-
-        event.stop_event()
+            self._waiting_for_image[event.get_sender_id()] = (time.time() + timeout, field_key, cn_name)
+            yield event.plain_result(
+                f"⚠️ 请发送图片或@引用图片后再使用 /{cn_name}\n"
+                f"⏳ 请在 {timeout} 秒内发送图片，超时自动退出检测"
+            )
 
     # 显式注册每个字段查询指令（完整中英文/大小写别名）
 
@@ -1719,25 +1785,88 @@ class CameraExifPlugin(Star):
     @filter.custom_filter(_AlwaysPassFilter, False)
     async def auto_detect_images(self, event: AstrMessageEvent):
         """监听所有消息，自动检测图片/文件中的EXIF并回复。
-
-        使用 regex(r\".*\") 而非 event_message_type，确保文件消息（无文本）
-        也能触发。优先级-10避免与指令冲突。
+        等待模式优先于 auto_detect_enabled 开关。
         """
-        if not self.config.get("enabled", True) or not self.config.get("auto_detect_enabled", True):
+        if not self.config.get("enabled", True):
             return
         if event.is_stopped():
             return
+
+        uid = event.get_sender_id()
+        in_waiting = uid in self._waiting_for_image
+        wait_field_key = ""
+        wait_cn_name = ""
+        now = time.time()
+        if in_waiting:
+            expiry, wait_field_key, wait_cn_name = self._waiting_for_image[uid]
+            if now > expiry:
+                del self._waiting_for_image[uid]
+                yield event.plain_result("⏰ 超时未发送图片，已退出检测")
+                return
+
+        # 非等待模式需检查开关 + 回复模式
+        if not in_waiting:
+            if not self.config.get("auto_detect_enabled", True):
+                return
+            if self.config.get("reply_mode", "文本发送") == "不发送":
+                return
+
         comps = event.get_messages()
+        found = False
         for comp in comps:
             if not self._is_processable_image(comp):
                 continue
+            found = True
+            if in_waiting:
+                self._waiting_for_image.pop(uid, None)
             try:
                 file_path = await self._get_file_path(comp)
                 if not file_path or not os.path.isfile(file_path):
+                    logger.warning(f"[相机EXIF] 文件下载失败: {getattr(comp, 'name', '') or comp.__class__.__name__}")
                     continue
-                show_hint = self.config.get("show_analyzing_hint", True)
-                async for reply in self._analyze_and_reply_image(event, file_path, show_analyzing=show_hint):
-                    yield reply
+                result = await self._analyze_image(file_path, event)
+                if not result:
+                    self._cleanup_temp_image(file_path)
+                    if in_waiting:
+                        yield event.plain_result("⚠️ 图片分析失败，请重试")
+                    continue
+                if not result.get("is_camera_image"):
+                    self._cleanup_temp_image(file_path)
+                    if in_waiting:
+                        yield event.plain_result("⚠️ 该图片不包含 EXIF 信息（截图/网图等非相机拍摄图片）")
+                    continue
+
+                # 等待模式有字段限制 → 只发对应字段
+                if in_waiting and wait_field_key:
+                    self._cleanup_temp_image(file_path)
+                    exif = result.get("exif_data", {})
+                    if wait_field_key == "shutter_count":
+                        sc = result.get("shutter_count") or "无法获取"
+                        yield event.plain_result(f"📷 {wait_cn_name}: {sc}")
+                    elif wait_field_key == "image_size":
+                        yield event.plain_result(f"🖼️ {wait_cn_name}: {exif.get('ImageWidth','?')} × {exif.get('ImageLength','?')} px")
+                    elif wait_field_key == "gps":
+                        gps = result.get("gps", {})
+                        if gps:
+                            lines = [f"📍 {wait_cn_name}:"]
+                            for k, v in gps.items():
+                                if k != "map_url" and v:
+                                    lines.append(f"  {k}: {v}")
+                            if gps.get("map_url"):
+                                lines.append(f"  🗺️ {gps['map_url']}")
+                            yield event.plain_result("\n".join(lines))
+                        else:
+                            yield event.plain_result("📍 该图片无GPS信息")
+                    else:
+                        val = exif.get(wait_field_key, "")
+                        yield event.plain_result(f"📸 {wait_cn_name}: {val}" if val else f"⚠️ 该图片未包含{wait_cn_name}信息")
+                else:
+                    # 完整回复（/exif或普通自动检测）
+                    show_hint = self.config.get("show_analyzing_hint", True)
+                    async for reply in self._analyze_and_reply_image(
+                        event, file_path, show_analyzing=show_hint, notify_no_exif=in_waiting
+                    ):
+                        yield reply
             except Exception as e:
                 logger.error(f"[相机EXIF] 自动检测错误: {e}", exc_info=True)
 
