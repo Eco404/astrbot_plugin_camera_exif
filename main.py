@@ -1215,13 +1215,13 @@ class CameraExifPlugin(Star):
                 return False, "您在黑名单中"
             return True, ""
 
-    def _format_reply(self, event: AstrMessageEvent, text: str, thumb_path: str | None = None) -> list:
-        """生成回复消息列表。转发模式下图文合一，文本模式分开发。"""
+    def _format_reply(self, event: AstrMessageEvent, text: str, thumb_path: str | None = None, force_plain: bool = False) -> list:
+        """生成回复消息列表。force_plain=True 时强制文本发送（字段查询指令用）。"""
         results = []
         reply_mode = self.config.get("reply_mode", "文本发送")
         forward_name = self.config.get("forward_display_name", "相机EXIF分析")
         logger.info(f"[相机EXIF] _format_reply: reply_mode={reply_mode!r}")
-        if reply_mode == "转发发送":
+        if reply_mode == "转发发送" and not force_plain:
             contents: list = [MsgPlain(text)]
             if thumb_path and os.path.isfile(thumb_path):
                 contents.append(MsgPlain("\n🖼️[图片预览]"))
@@ -1394,15 +1394,17 @@ class CameraExifPlugin(Star):
 
     async def _reply_result(self, event: AstrMessageEvent, file_path: str,
                             mode: str, field_key: str = "", cn_name: str = ""):
-        """分析图片并回复：消息1=EXIF文本, 消息2=预览图"""
+        """分析图片并回复。字段查询强制文本发送、不发预览图。"""
         result = await self._analyze_image(file_path, event)
         if not result:
             self._cleanup_temp_image(file_path)
             return
 
-        # 预览图（必须在清理前生成）
+        is_field_query = mode != "full"
         thumb_path = None
-        if self.config.get("send_preview_thumbnail", False):
+
+        # 预览图仅完整查询 + 自动检测时生成
+        if not is_field_query and self.config.get("send_preview_thumbnail", False):
             thumb_path = await self._make_preview(file_path)
 
         self._cleanup_temp_image(file_path)
@@ -1429,7 +1431,7 @@ class CameraExifPlugin(Star):
             else:
                 val = exif.get(field_key, "")
                 text = f"📸 {cn_name}: {val}" if val else f"⚠️ 该图片未包含{cn_name}信息"
-        for r in self._format_reply(event, text, thumb_path):
+        for r in self._format_reply(event, text, thumb_path, force_plain=is_field_query):
             yield r
 
     # ── 消息处理 ──
