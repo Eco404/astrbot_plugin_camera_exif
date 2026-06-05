@@ -192,6 +192,9 @@ pip install rawpy numpy
 
 **昊天兽王** — [GitHub](https://github.com/haotianshouwang)
 
+## 开发过程
+项目开发借助**CodeBuddy**辅助完成。
+
 ## 📄 许可证
 [![CC BY-NC 4.0](https://licensebuttons.net/l/by-nc/4.0/88x31.png)](https://creativecommons.org/licenses/by-nc/4.0/)
 
