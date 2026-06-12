@@ -243,5 +243,18 @@
         "default": []
       }
     }
+  },
+  "gps_map_provider": {
+    "description": "\ud83d\uddfa\ufe0f GPS地图提供商",
+    "type": "string",
+    "hint": "选择GPS位置信息使用的地图链接。国内推荐高德/百度/腾讯，海外可用Google/OpenStreetMap。坐标系自动转换。",
+    "options": ["高德地图", "百度地图", "腾讯地图", "Google Maps", "OpenStreetMap", "自定义"],
+    "default": "高德地图"
+  },
+  "gps_custom_map_url": {
+    "description": "自定义地图URL模板(仅\"自定义\"模式)",
+    "type": "string",
+    "hint": "使用 {lat} {lng} 占位符（自动转换坐标系），{lat_wgs} {lng_wgs} 为原始WGS-84坐标。留空使用默认高德。",
+    "default": ""
   }
 }
