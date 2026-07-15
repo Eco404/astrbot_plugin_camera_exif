@@ -208,7 +208,7 @@ def format_display_text(
 
 
 def format_full_exif_text(result: dict[str, Any]) -> str:
-    """格式化完整的 EXIF 数据（用于 /exif 指令）。
+    """格式化完整的 EXIF 数据（用于 /exif full 指令）。
 
     Args:
         result: ExifAnalyzer.analyze() 返回的结构化结果

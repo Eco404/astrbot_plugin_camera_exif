@@ -3,15 +3,13 @@
 
 CameraExifPlugin 类负责：
 - 消息监听与自动检测
-- 指令路由（19 个字段查询 + 完整元数据 + 帮助菜单）
+- 指令路由（/exif 命令组、字段查询、完整元数据）
 - 权限隔离、频率限制、黑白名单
 - 图片下载、分析、回复、清理
 - 等待模式（先输入指令后发图）
 
 核心分析引擎见 libs.exif_analyzer.ExifAnalyzer
 """
-
-from __future__ import annotations
 
 import asyncio
 import os
@@ -83,6 +81,18 @@ class _AlwaysPassFilter(filter.CustomFilter):
 
     def filter(self, event: AstrMessageEvent, cfg) -> bool:
         return True
+
+
+def _strip_group_command_whitespace(command_group: Any) -> Any:
+    """让 AstrBot 命令组的子指令匹配忽略 @ 后残留的前导空白。"""
+    group_filter = command_group.parent_group
+    original_startswith = group_filter.startswith
+
+    def startswith(message: str) -> bool:
+        return original_startswith(message.strip())
+
+    group_filter.startswith = startswith
+    return command_group
 
 
 # ================================================================
@@ -575,9 +585,10 @@ class CameraExifPlugin(Star):
             return
 
         timeout = self.config.get("wait_timeout_seconds", 120)
+        command_hint = f"/exif get {cn_name}"
         if timeout <= 0:
             yield event.plain_result(
-                f"\u26a0\ufe0f 请发送图片或@引用图片后再使用 /{cn_name}"
+                f"\u26a0\ufe0f 请发送图片或@引用图片后再使用 {command_hint}"
             )
         else:
             self._waiting_for_image[event.get_sender_id()] = (
@@ -586,49 +597,56 @@ class CameraExifPlugin(Star):
                 cn_name,
             )
             yield event.plain_result(
-                f"\u26a0\ufe0f 请发送图片或@引用图片后再使用 /{cn_name}\n"
+                f"\u26a0\ufe0f 请发送图片或@引用图片后再使用 {command_hint}\n"
                 f"\u23f3 请在 {timeout} 秒内发送图片，超时自动退出检测"
             )
 
     # ================================================================
-    # 指令区 — /exif帮助
+    # 指令区 — /exif 命令组
     # ================================================================
 
-    @filter.command("exif帮助", alias={"exif help", "exif菜单", "exif menu"})
+    @_strip_group_command_whitespace
+    @filter.command_group("exif")
+    def exif(self):
+        """相机 EXIF 查询命令组。"""
+        pass
+
+    @exif.command("help")
     async def exif_help(self, event: AstrMessageEvent):
         """显示帮助菜单。"""
+        event.stop_event()
         allowed, reason = self._check_access(event)
         if not allowed:
             yield event.plain_result(f"\u26a0\ufe0f {reason}")
             return
         cmds = "\n".join(
-            f"  /{k}  \u2514 查询{fv}"
-            for k, v in sorted(
-                FIELD_COMMAND_MAP.items(),
-                key=lambda x: (list(FIELD_COMMAND_MAP.values()).index(x[1]), x[0]),
-            )
-            if not k.endswith("查询") and (fv := FIELD_CN_NAMES.get(v, v))
+            f"  /exif get {field_name}"
+            for field_name in FIELD_CN_NAMES.values()
         )
-        help_text = (
-            "\U0001f4f8 相机EXIF分析插件 — 使用帮助\n"
-            "\u2550" * 36 + "\n\n"
-            "\U0001f4cb 完整查询：\n"
-            "  /exif帮助  \u2514 显示本帮助菜单\n"
-            "  /exif      \u2514 查询我的图片完整EXIF元数据\n\n"
-            "\U0001f4ca 字段单独查询：\n"
-            f"{cmds[:1200]}\n\n"
-            "\U0001f4f8 支持格式：JPEG/TIFF/PNG/RAW(CR2/NEF/ARW等)/DNG\n"
-            "\u2550" * 36
+        separator = "\u2550" * 36
+        help_text = "\n".join(
+            [
+                "\U0001f4f8 相机EXIF分析插件 — 使用帮助",
+                separator,
+                "",
+                "\U0001f4cb 命令：",
+                "  /exif help  \u2514 显示本帮助菜单",
+                "  /exif full  \u2514 查询完整EXIF元数据",
+                "  /exif get <字段>  \u2514 查询单个字段",
+                "",
+                "\U0001f4ca 字段单独查询：",
+                cmds,
+                "",
+                "\U0001f4f8 支持格式：JPEG/TIFF/PNG/RAW(CR2/NEF/ARW等)/DNG",
+                separator,
+            ]
         )
         yield event.plain_result(help_text)
 
-    # ================================================================
-    # 指令区 — /exif 完整查询
-    # ================================================================
-
-    @filter.command("exif")
+    @exif.command("full")
     async def query_exif(self, event: AstrMessageEvent):
         """查询完整 EXIF 元数据。"""
+        event.stop_event()
         allowed, reason = self._check_access(event)
         if not allowed:
             yield event.plain_result(f"\u26a0\ufe0f {reason}")
@@ -653,7 +671,9 @@ class CameraExifPlugin(Star):
 
         timeout = self.config.get("wait_timeout_seconds", 120)
         if timeout <= 0:
-            yield event.plain_result("\u26a0\ufe0f 请发送图片或@引用图片后再使用 /exif")
+            yield event.plain_result(
+                "\u26a0\ufe0f 请发送图片或@引用图片后再使用 /exif full"
+            )
             return
         self._waiting_for_image[event.get_sender_id()] = (
             time.time() + timeout,
@@ -661,145 +681,35 @@ class CameraExifPlugin(Star):
             "完整EXIF",
         )
         yield event.plain_result(
-            "\u26a0\ufe0f 请发送图片或@引用图片后再使用 /exif\n"
+            "\u26a0\ufe0f 请发送图片或@引用图片后再使用 /exif full\n"
             f"\u23f3 请在 {timeout} 秒内发送图片，超时自动退出检测"
         )
 
-    # ================================================================
-    # 指令区 — 19 个字段单独查询
-    # ================================================================
+    @exif.command("get")
+    async def query_exif_field(self, event: AstrMessageEvent, field: str):
+        """查询指定 EXIF 字段。"""
+        event.stop_event()
+        normalized_field = field.strip().casefold()
+        field_key = next(
+            (
+                key
+                for name, key in FIELD_COMMAND_MAP.items()
+                if name.casefold() == normalized_field
+            ),
+            None,
+        )
+        if not field_key:
+            supported = "、".join(FIELD_CN_NAMES.values())
+            yield event.plain_result(
+                f"\u26a0\ufe0f 不支持的 EXIF 字段：{field}\n"
+                f"可用字段：{supported}\n"
+                "使用 /exif help 查看完整帮助"
+            )
+            return
 
-    @filter.command("快门次数", alias={"快门次数查询", "shuttercount", "SC"})
-    async def q_shutter(self, event: AstrMessageEvent):
-        async for r in self._query_field(event, "shutter_count", "快门次数"):
-            yield r
-
-    @filter.command(
-        "快门",
-        alias={
-            "快门速度",
-            "快门值",
-            "快门查询",
-            "曝光时间",
-            "曝光时间查询",
-            "shutterspeed",
-            "shutter",
-        },
-    )
-    async def q_shutter_speed(self, event: AstrMessageEvent):
-        async for r in self._query_field(event, "ExposureTime", "快门速度"):
-            yield r
-
-    @filter.command("相机型号", alias={"相机型号查询", "型号", "型号查询", "model"})
-    async def q_model(self, event: AstrMessageEvent):
-        async for r in self._query_field(event, "Model", "相机型号"):
-            yield r
-
-    @filter.command("相机品牌", alias={"相机品牌查询", "品牌", "品牌查询", "make"})
-    async def q_make(self, event: AstrMessageEvent):
-        async for r in self._query_field(event, "Make", "相机品牌"):
-            yield r
-
-    @filter.command("镜头型号", alias={"镜头型号查询", "镜头", "镜头查询", "lens"})
-    async def q_lens_model(self, event: AstrMessageEvent):
-        async for r in self._query_field(event, "LensModel", "镜头型号"):
-            yield r
-
-    @filter.command("镜头品牌", alias={"镜头品牌查询", "lensmake"})
-    async def q_lens_make(self, event: AstrMessageEvent):
-        async for r in self._query_field(event, "LensMake", "镜头品牌"):
-            yield r
-
-    @filter.command("焦距", alias={"焦距查询", "focal", "focallength"})
-    async def q_focal(self, event: AstrMessageEvent):
-        async for r in self._query_field(event, "FocalLength", "焦距"):
-            yield r
-
-    @filter.command(
-        "光圈",
-        alias={"光圈查询", "光圈值", "光圈值查询", "aperture", "fnumber"},
-    )
-    async def q_aperture(self, event: AstrMessageEvent):
-        async for r in self._query_field(event, "FNumber", "光圈值"):
-            yield r
-
-    @filter.command(
-        "ISO",
-        alias={"ISO查询", "iso", "iso查询", "感光度", "感光度查询", "ISOSpeed"},
-    )
-    async def q_iso(self, event: AstrMessageEvent):
-        async for r in self._query_field(event, "ISOSpeedRatings", "ISO感光度"):
-            yield r
-
-    @filter.command("测光模式", alias={"测光模式查询", "测光", "测光查询", "metering"})
-    async def q_metering(self, event: AstrMessageEvent):
-        async for r in self._query_field(event, "MeteringMode", "测光模式"):
-            yield r
-
-    @filter.command("曝光模式", alias={"曝光模式查询", "曝光", "曝光查询", "exposure"})
-    async def q_exposure_prog(self, event: AstrMessageEvent):
-        async for r in self._query_field(event, "ExposureProgram", "曝光模式"):
-            yield r
-
-    @filter.command("曝光补偿", alias={"曝光补偿查询", "EV", "ev", "exposurebias"})
-    async def q_exposure_bias(self, event: AstrMessageEvent):
-        async for r in self._query_field(event, "ExposureBiasValue", "曝光补偿"):
-            yield r
-
-    @filter.command("闪光灯", alias={"闪光灯查询", "闪光", "闪光查询", "flash"})
-    async def q_flash(self, event: AstrMessageEvent):
-        async for r in self._query_field(event, "Flash", "闪光灯"):
-            yield r
-
-    @filter.command("白平衡", alias={"白平衡查询", "whitebalance", "wb"})
-    async def q_wb(self, event: AstrMessageEvent):
-        async for r in self._query_field(event, "WhiteBalance", "白平衡"):
-            yield r
-
-    @filter.command(
-        "拍摄时间",
-        alias={"拍摄时间查询", "时间", "时间查询", "datetime", "date"},
-    )
-    async def q_datetime(self, event: AstrMessageEvent):
-        async for r in self._query_field(event, "DateTimeOriginal", "拍摄时间"):
-            yield r
-
-    @filter.command(
-        "机身序列号",
-        alias={"机身序列号查询", "序列号", "序列号查询", "serial", "sn"},
-    )
-    async def q_serial(self, event: AstrMessageEvent):
-        async for r in self._query_field(event, "BodySerialNumber", "机身序列号"):
-            yield r
-
-    @filter.command(
-        "图片尺寸",
-        alias={
-            "图片尺寸查询",
-            "尺寸",
-            "尺寸查询",
-            "分辨率",
-            "分辨率查询",
-            "size",
-            "resolution",
-        },
-    )
-    async def q_size(self, event: AstrMessageEvent):
-        async for r in self._query_field(event, "image_size", "图片尺寸"):
-            yield r
-
-    @filter.command("处理软件", alias={"处理软件查询", "软件", "软件查询", "software"})
-    async def q_software(self, event: AstrMessageEvent):
-        async for r in self._query_field(event, "Software", "处理软件"):
-            yield r
-
-    @filter.command(
-        "GPS",
-        alias={"GPS查询", "gps", "位置", "位置查询", "定位", "定位查询"},
-    )
-    async def q_gps(self, event: AstrMessageEvent):
-        async for r in self._query_field(event, "gps", "GPS信息"):
-            yield r
+        cn_name = FIELD_CN_NAMES.get(field_key, field)
+        async for result in self._query_field(event, field_key, cn_name):
+            yield result
 
     # ================================================================
     # 自动检测 — 监听所有消息（等待模式优先）
@@ -897,7 +807,7 @@ class CameraExifPlugin(Star):
                             else f"\u26a0\ufe0f 该图片未包含{wait_cn_name}信息"
                         )
                 else:
-                    # 完整回复（/exif 或普通自动检测）
+                    # 完整回复（/exif full 或普通自动检测）
                     show_hint = self.config.get("show_analyzing_hint", True)
                     async for reply in self._analyze_and_reply_image(
                         event,
